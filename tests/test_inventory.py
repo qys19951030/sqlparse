@@ -291,3 +291,65 @@ def test_cte_body_contains_subquery_and_join():
     )
     result = collect(sql_text)[0]
     assert _table_keys(result) == [("a",), ("b",)]
+
+
+# ---------------------------------------------------------------------------
+# Step 4: merging of repeated tables and occurrence counts
+# ---------------------------------------------------------------------------
+
+def test_same_table_merged_with_accumulated_count():
+    sql_text = (
+        "SELECT * FROM t1 JOIN t1 AS x ON 1=1 "
+        "WHERE id IN (SELECT id FROM t1);"
+    )
+    result = collect(sql_text)[0]
+    assert len(result.tables) == 1
+    table = result.tables[0]
+    assert table.name == ("t1",)
+    assert table.count == 3
+
+
+def test_different_writings_of_same_table_merge():
+    sql_text = (
+        "SELECT * FROM `schema`.`tbl` "
+        "JOIN SCHEMA.tbl t ON 1=1 JOIN schema.tbl ON 1=1;"
+    )
+    result = collect(sql_text)[0]
+    assert len(result.tables) == 1
+    assert result.tables[0].name == ("schema", "tbl")
+    assert result.tables[0].count == 3
+    assert result.tables[0].alias == "t"
+
+
+def test_quoted_content_is_case_preserved():
+    # Double-quoted content is kept verbatim per the normalization
+    # rules, so "Tbl" and the unquoted, lower-cased tbl stay distinct.
+    result = collect('SELECT * FROM schema."Tbl" JOIN schema.tbl ON 1=1;')[0]
+    assert _table_keys(result) == [("schema", "Tbl"), ("schema", "tbl")]
+
+
+def test_counts_are_per_statement():
+    sql_text = (
+        "SELECT * FROM t1 JOIN t1 ON 1=1; "
+        "SELECT * FROM t1; "
+        "SELECT * FROM other;"
+    )
+    result = collect(sql_text)
+    assert result[0].tables[0].count == 2
+    assert result[1].tables[0].count == 1
+    assert result[2].tables[0].name == ("other",)
+
+
+def test_read_and_write_of_same_table_are_separate_entries():
+    result = collect(
+        "INSERT INTO t1 SELECT * FROM t1 JOIN t1 ON 1=1;")[0]
+    entries = [(t.name, t.mode, t.count) for t in result.tables]
+    assert entries == [(("t1",), "write", 1), (("t1",), "read", 2)]
+
+
+def test_first_occurrence_order_is_preserved():
+    result = collect("SELECT * FROM zeta, alpha, zeta, beta, alpha;")[0]
+    assert _table_keys(result) == [("zeta",), ("alpha",), ("beta",)]
+    assert result.tables[0].count == 2
+    assert result.tables[1].count == 2
+    assert result.tables[2].count == 1

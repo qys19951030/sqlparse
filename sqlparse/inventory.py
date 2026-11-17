@@ -139,7 +139,7 @@ class _Collector:
     def __init__(self, statement: sql.Statement):
         self.statement = statement
         self.tables: list[TableRef] = []
-        self._table_index: dict[tuple[str, ...], TableRef] = {}
+        self._table_index: dict[tuple, TableRef] = {}
         self.columns: list[ColumnRef] = []
         self._column_keys: set[tuple[str, ...]] = set()
 
@@ -326,8 +326,18 @@ class _Collector:
         # CTE names shadow physical tables inside their scope.
         if segments[0] in cte_scope:
             return
-        self.tables.append(
-            TableRef(name=segments, alias=alias, mode=mode, count=1))
+        # Read sources and write targets are inventoried separately even
+        # when they happen to be the same physical table.
+        key = (segments, mode)
+        existing = self._table_index.get(key)
+        if existing is not None:
+            existing.count += 1
+            if existing.alias is None and alias is not None:
+                existing.alias = alias
+            return
+        ref = TableRef(name=segments, alias=alias, mode=mode, count=1)
+        self._table_index[key] = ref
+        self.tables.append(ref)
 
     def _record_column(self, identifier: sql.Identifier):
         raise NotImplementedError
