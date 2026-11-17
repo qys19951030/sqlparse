@@ -79,6 +79,7 @@ _REGION_END_KEYWORDS = (
     "SET",
     "RETURNING",
     "VALUES",
+    "WINDOW",
 )
 
 
@@ -101,13 +102,20 @@ def _normalize_segment(value: str) -> str:
 def _identifier_segments(token: sql.TokenList) -> tuple[str, ...]:
     """Return the normalized name segments of an identifier.
 
-    Only leaf name tokens contribute, so function parentheses, typecasts
-    and similar sub-groups are ignored.
+    Only the name part before an alias (``AS`` keyword or a nested
+    identifier) contributes, and only leaf name tokens are considered,
+    so function parentheses, typecasts and similar sub-groups are
+    ignored.
     """
     segments = []
-    for leaf in token.flatten():
-        if leaf.ttype in _NAME_TYPES:
-            segments.append(_normalize_segment(leaf.value))
+    for child in token.tokens:
+        if child.match(T.Keyword, "AS"):
+            break
+        if isinstance(child, sql.Identifier):
+            # Everything from here on is the alias part.
+            break
+        if not child.is_group and child.ttype in _NAME_TYPES:
+            segments.append(_normalize_segment(child.value))
     return tuple(segments)
 
 
@@ -140,16 +148,94 @@ class _Collector:
     # -- token traversal -------------------------------------------------
 
     def _walk(self, token_list: sql.TokenList, cte_scope: tuple[str, ...]):
-        # Traverse the token tree without collecting anything yet;
-        # later steps add clause-aware table/column extraction here.
+        # Clause-aware walk at one grouping level.  ``state`` tracks the
+        # table-bearing clause the following identifier belongs to.
+        state = None
         for token in token_list.tokens:
             if token.is_group:
-                self._walk(token, cte_scope)
+                self._visit_group(token, state, cte_scope)
+                continue
+
+            if not token.is_keyword:
+                continue
+
+            keyword = token.normalized
+            if keyword in _FROM_KEYWORDS:
+                # DELETE FROM is a write target; every other FROM/JOIN/
+                # USING clause starts a read-source region.
+                if keyword == "FROM" and self._is_delete_context(token_list):
+                    state = "write"
+                else:
+                    state = "read"
+            elif keyword in _TARGET_KEYWORDS:
+                state = "write"
+            elif keyword in _REGION_END_KEYWORDS:
+                state = None
+            elif token.ttype in (T.Keyword.DML, T.Keyword.DDL, T.Keyword.CTE):
+                # A new inner query starts; its FROM is found again by
+                # the keyword scan below.
+                state = None
+
+    def _visit_group(self, token: sql.TokenList, state,
+                     cte_scope: tuple[str, ...]):
+        if isinstance(token, sql.IdentifierList):
+            if state in ("read", "write"):
+                for child in token.get_identifiers():
+                    self._visit_identifier(child, state, cte_scope)
+                return
+            self._walk(token, cte_scope)
+        elif isinstance(token, sql.Identifier):
+            if state in ("read", "write"):
+                self._visit_identifier(token, state, cte_scope)
+                return
+            self._walk(token, cte_scope)
+        elif isinstance(token, sql.Function):
+            # INSERT INTO target with a column list is grouped as a
+            # Function; its leading identifier is the target table.
+            if state == "write":
+                target = token.token_next_by(i=sql.Identifier)[1]
+                if target is not None:
+                    segments = _identifier_segments(target)
+                    if segments:
+                        self._record_table(
+                            segments, _identifier_alias(target), "write",
+                            cte_scope)
+            self._walk(token, cte_scope)
+        elif isinstance(token, sql.Parenthesis):
+            # Subquery: descend without inheriting the current clause,
+            # e.g. the column list of USING (...) must not be read as
+            # tables.
+            self._walk(token, cte_scope)
+        else:
+            self._walk(token, cte_scope)
+
+    def _visit_identifier(self, token: sql.Identifier, mode,
+                          cte_scope: tuple[str, ...]):
+        # A parenthesised body means a derived table (subquery in FROM);
+        # its alias is not a table name, the inner query is walked.
+        inner = token.token_next_by(i=sql.Parenthesis)[1]
+        if inner is not None:
+            self._walk(inner, cte_scope)
+            return
+        segments = _identifier_segments(token)
+        if not segments:
+            return
+        self._record_table(
+            segments, _identifier_alias(token), mode, cte_scope)
+
+    @staticmethod
+    def _is_delete_context(token_list: sql.TokenList) -> bool:
+        first = token_list.token_first(skip_cm=True)
+        return first is not None and first.match(T.Keyword.DML, "DELETE")
 
     # -- reference recording ---------------------------------------------
 
-    def _record_table(self, segments, alias, mode):
-        raise NotImplementedError
+    def _record_table(self, segments, alias, mode, cte_scope):
+        # CTE names shadow physical tables inside their scope.
+        if segments[0] in cte_scope:
+            return
+        self.tables.append(
+            TableRef(name=segments, alias=alias, mode=mode, count=1))
 
     def _record_column(self, identifier: sql.Identifier):
         raise NotImplementedError

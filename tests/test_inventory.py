@@ -59,3 +59,151 @@ def test_collect_empty_and_whitespace_statements():
     assert len(result) == 4
     assert all(item.type == "UNKNOWN" for item in result)
     assert all(item.tables == [] and item.columns == [] for item in result)
+
+
+# ---------------------------------------------------------------------------
+# Step 2: FROM / JOIN table extraction
+# ---------------------------------------------------------------------------
+
+def _table_keys(inventory):
+    return [table.name for table in inventory.tables]
+
+
+def test_from_single_table():
+    result = collect("SELECT * FROM t1;")
+    assert _table_keys(result[0]) == [("t1",)]
+    assert result[0].tables[0].mode == "read"
+    assert result[0].tables[0].alias is None
+
+
+def test_join_chain_and_on_columns_are_not_tables():
+    sql_text = (
+        "SELECT a.x FROM schema.tbl_a AS a "
+        "JOIN tbl_b b ON a.id = b.id "
+        "LEFT JOIN d.tbl_c c ON c.id = b.id;"
+    )
+    result = collect(sql_text)[0]
+    assert _table_keys(result) == [
+        ("schema", "tbl_a"), ("tbl_b",), ("d", "tbl_c")]
+    assert [table.alias for table in result.tables] == ["a", "b", "c"]
+    assert all(table.mode == "read" for table in result.tables)
+
+
+def test_comma_separated_identifier_list():
+    result = collect("SELECT * FROM t1, t2, schema3.t3;")[0]
+    assert _table_keys(result) == [("t1",), ("t2",), ("schema3", "t3")]
+
+
+def test_quoted_and_qualified_name_normalization():
+    sql_text = (
+        'SELECT * FROM "Mixed"."Tbl" AS m '
+        "JOIN `back_t` b ON 1=1 "
+        "JOIN [br_t] c ON 1=1;"
+    )
+    result = collect(sql_text)[0]
+    assert _table_keys(result) == [
+        ("Mixed", "Tbl"), ("back_t",), ("br_t",)]
+    assert [table.alias for table in result.tables] == ["m", "b", "c"]
+
+
+def test_derived_table_subquery_is_walked_not_named():
+    sql_text = (
+        "SELECT * FROM (SELECT id FROM inner_t) sub, outer_t;"
+    )
+    result = collect(sql_text)[0]
+    assert _table_keys(result) == [("inner_t",), ("outer_t",)]
+    # the derived-table alias must not appear as a table
+    assert all("sub" not in name for name in _table_keys(result))
+
+
+def test_deeply_nested_subqueries():
+    sql_text = (
+        "select * from (select * from (select * from deep_t) x) y;"
+    )
+    result = collect(sql_text)[0]
+    assert _table_keys(result) == [("deep_t",)]
+
+
+def test_insert_target_and_select_sources_are_separate_modes():
+    sql_text = (
+        "INSERT INTO target_t (a, b) SELECT x, y FROM src_t "
+        "WHERE x IN (SELECT x FROM src2);"
+    )
+    result = collect(sql_text)[0]
+    by_mode = {}
+    for table in result.tables:
+        by_mode.setdefault(table.mode, []).append(table.name)
+    assert by_mode["write"] == [("target_t",)]
+    assert by_mode["read"] == [("src_t",), ("src2",)]
+
+
+def test_insert_without_column_list():
+    result = collect("INSERT INTO t1 SELECT * FROM t2;")[0]
+    by_mode = {}
+    for table in result.tables:
+        by_mode.setdefault(table.mode, []).append(table.name)
+    assert by_mode == {"write": [("t1",)], "read": [("t2",)]}
+
+
+def test_update_target_from_and_set_subquery():
+    sql_text = (
+        "UPDATE t1 SET a = (SELECT max(a) FROM t2) "
+        "FROM t3 WHERE t1.id = t3.id;"
+    )
+    result = collect(sql_text)[0]
+    by_mode = {}
+    for table in result.tables:
+        by_mode.setdefault(table.mode, []).append(table.name)
+    assert by_mode == {
+        "write": [("t1",)], "read": [("t2",), ("t3",)]}
+
+
+def test_delete_from_and_using_with_join():
+    sql_text = (
+        "DELETE FROM t1 USING t2 JOIN t3 ON t2.id = t3.id "
+        "WHERE t1.id = t2.id;"
+    )
+    result = collect(sql_text)[0]
+    by_mode = {}
+    for table in result.tables:
+        by_mode.setdefault(table.mode, []).append(table.name)
+    assert by_mode == {
+        "write": [("t1",)], "read": [("t2",), ("t3",)]}
+
+
+def test_values_insert_only_has_target():
+    result = collect("INSERT INTO t1 VALUES (1, 2), (3, 4);")[0]
+    assert [(t.name, t.mode) for t in result.tables] == [
+        (("t1",), "write")]
+
+
+def test_functions_are_not_tables():
+    result = collect(
+        "SELECT count(*) FROM t1 WHERE x = my_func(1);")[0]
+    assert _table_keys(result) == [("t1",)]
+
+
+def test_merge_target_and_source():
+    sql_text = (
+        "MERGE INTO tgt USING src ON tgt.id = src.id "
+        "WHEN MATCHED THEN UPDATE SET a = 1;"
+    )
+    result = collect(sql_text)[0]
+    by_mode = {}
+    for table in result.tables:
+        by_mode.setdefault(table.mode, []).append(table.name)
+    assert by_mode == {"write": [("tgt",)], "read": [("src",)]}
+
+
+def test_union_collects_both_branches():
+    result = collect(
+        "SELECT id FROM t1 UNION ALL SELECT id FROM t2;")[0]
+    assert _table_keys(result) == [("t1",), ("t2",)]
+
+
+def test_select_list_scalar_subquery_is_covered():
+    sql_text = (
+        "SELECT (SELECT max(id) FROM t2) AS m, name FROM t1;"
+    )
+    result = collect(sql_text)[0]
+    assert _table_keys(result) == [("t2",), ("t1",)]
