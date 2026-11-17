@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from sqlparse import parse, sql
+from sqlparse import sql
 from sqlparse import tokens as T
 
 __all__ = ["ColumnRef", "StatementInventory", "TableRef", "collect"]
@@ -593,4 +593,8 @@ def collect(sql_text: str) -> list[StatementInventory]:
     :returns: A list of :class:`StatementInventory` instances, one per
         statement, in the same order as :func:`sqlparse.split`.
     """
+    # Imported lazily to avoid a circular import with the package
+    # initializer (which imports this module).
+    from sqlparse import parse
+
     return [_Collector(statement).collect() for statement in parse(sql_text)]
