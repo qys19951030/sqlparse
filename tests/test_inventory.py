@@ -524,3 +524,31 @@ def test_malformed_sql_does_not_raise():
         ";;;",
     ):
         assert isinstance(collect(sql_text), list)
+
+
+def test_delete_target_is_write_with_leading_cte():
+    result = collect(
+        "WITH c AS (SELECT id FROM base) "
+        "DELETE FROM t1 USING c WHERE t1.id = c.id;")[0]
+    by_mode = {}
+    for table in result.tables:
+        by_mode.setdefault(table.mode, []).append(table.name)
+    assert by_mode == {"read": [("base",)], "write": [("t1",)]}
+
+
+def test_insert_select_with_cte_source():
+    result = collect(
+        "WITH c AS (SELECT * FROM base) "
+        "INSERT INTO t SELECT * FROM c;")[0]
+    by_mode = {}
+    for table in result.tables:
+        by_mode.setdefault(table.mode, []).append(table.name)
+    assert by_mode == {"read": [("base",)], "write": [("t",)]}
+
+
+def test_exists_subquery_tables_and_columns():
+    result = collect(
+        "SELECT * FROM outer_t o WHERE EXISTS "
+        "(SELECT 1 FROM inner_t i WHERE i.x = o.x);")[0]
+    assert _table_keys(result) == [("outer_t",), ("inner_t",)]
+    assert _column_refs(result) == [("i", "x"), ("o", "x")]

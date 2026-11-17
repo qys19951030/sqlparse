@@ -236,7 +236,7 @@ class _Collector:
                 continue
             keyword = token.normalized
             if keyword in _FROM_KEYWORDS:
-                if keyword == "FROM" and self._is_delete_context(token_list):
+                if keyword == "FROM" and self._is_delete_context(tokens):
                     state = "write"
                 else:
                     state = "read"
@@ -417,8 +417,8 @@ class _Collector:
             for token in parenthesis.flatten())
 
     @staticmethod
-    def _is_delete_context(token_list) -> bool:
-        for token in token_list.tokens:
+    def _is_delete_context(tokens) -> bool:
+        for token in tokens:
             if token.is_whitespace or token.ttype in T.Comment:
                 continue
             return token.match(T.Keyword.DML, "DELETE")
