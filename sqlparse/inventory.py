@@ -30,6 +30,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from sqlparse import sql
+
 __all__ = ["ColumnRef", "StatementInventory", "TableRef", "collect"]
 
 
@@ -86,6 +88,22 @@ class StatementInventory:
     columns: list[ColumnRef] = field(default_factory=list)
 
 
+class _Collector:
+    """Collects the references of one statement."""
+
+    def __init__(self, statement: sql.Statement):
+        self.statement = statement
+        self.tables: list[TableRef] = []
+        self.columns: list[ColumnRef] = []
+
+    def collect(self) -> StatementInventory:
+        return StatementInventory(
+            type=self.statement.get_type(),
+            tables=self.tables,
+            columns=self.columns,
+        )
+
+
 def collect(sql_text: str) -> list[StatementInventory]:
     """Collect table and column references from *sql_text*.
 
@@ -93,4 +111,8 @@ def collect(sql_text: str) -> list[StatementInventory]:
     :returns: one :class:`StatementInventory` per statement, in the
         same order as :func:`sqlparse.split`.
     """
-    return []
+    # Imported lazily to avoid a circular import: the package
+    # initializer imports this module.
+    from sqlparse import parse
+
+    return [_Collector(statement).collect() for statement in parse(sql_text)]
