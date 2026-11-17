@@ -221,3 +221,78 @@ def test_table_function_is_not_a_table():
 def test_table_function_alias_column_list_not_inventoried():
     result = collect("SELECT * FROM generate_series(1, 5) AS g;")[0]
     assert result.tables == []
+
+
+# ---------------------------------------------------------------------------
+# Step 3: CTE expansion
+# ---------------------------------------------------------------------------
+
+def test_cte_name_is_not_a_table_but_its_sources_are():
+    result = collect(
+        "WITH cte1 AS (SELECT id FROM base_tbl) SELECT * FROM cte1;")[0]
+    assert _table_keys(result) == [("base_tbl",)]
+    assert result.tables[0].mode == "read"
+
+
+def test_multi_level_cte_resolves_to_physical_tables():
+    result = collect(
+        "WITH cte1 AS (SELECT id FROM base_tbl), "
+        "cte2 AS (SELECT id FROM cte1 JOIN other_tbl USING (id)) "
+        "SELECT * FROM cte2;")[0]
+    assert _table_keys(result) == [("base_tbl",), ("other_tbl",)]
+
+
+def test_cte_shadows_physical_table_with_same_name():
+    result = collect(
+        "WITH t1 AS (SELECT id FROM real_t) SELECT * FROM t1;")[0]
+    assert _table_keys(result) == [("real_t",)]
+
+
+def test_cte_column_list_form():
+    result = collect(
+        "WITH c (a, b) AS (SELECT a, b FROM base) SELECT * FROM c;")[0]
+    assert _table_keys(result) == [("base",)]
+
+
+def test_nested_with_in_derived_table():
+    result = collect(
+        "SELECT * FROM "
+        "(WITH x AS (SELECT id FROM deep_t) SELECT * FROM x) z;")[0]
+    assert _table_keys(result) == [("deep_t",)]
+    assert all("x" not in name and "z" not in name
+               for name in _table_keys(result))
+
+
+def test_cte_with_update_statement():
+    result = collect(
+        "WITH c AS (SELECT id FROM base) "
+        "UPDATE t1 SET a=1 FROM c WHERE t1.id = c.id;")[0]
+    by_mode = {}
+    for table in result.tables:
+        by_mode.setdefault(table.mode, []).append(table.name)
+    assert by_mode == {"read": [("base",)], "write": [("t1",)]}
+
+
+def test_cte_scope_is_per_statement():
+    result = collect(
+        "WITH c AS (SELECT id FROM t_a) SELECT * FROM c; "
+        "SELECT * FROM c;")
+    assert _table_keys(result[0]) == [("t_a",)]
+    # the second statement has no CTE scope: c is a plain table
+    assert _table_keys(result[1]) == [("c",)]
+
+
+def test_cte_body_contains_subquery_and_join():
+    result = collect(
+        "WITH c AS ("
+        "SELECT * FROM a JOIN (SELECT id FROM b) s ON a.id = s.id"
+        ") SELECT * FROM c;")[0]
+    assert _table_keys(result) == [("a",), ("b",)]
+
+
+def test_recursive_cte_self_reference_resolves_to_base_table():
+    result = collect(
+        "WITH RECURSIVE r AS ("
+        "SELECT id FROM base UNION ALL SELECT id FROM r"
+        ") SELECT * FROM r;")[0]
+    assert _table_keys(result) == [("base",)]

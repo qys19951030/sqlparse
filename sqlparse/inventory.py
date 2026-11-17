@@ -203,11 +203,22 @@ class _Collector:
 
     def _walk(self, token_list: sql.TokenList,
               cte_scope: tuple[str, ...],
-              initial_state: str | None = None) -> None:
+              initial_state: str | None = None,
+              precollect_ctes: bool = True) -> None:
+        tokens = token_list.tokens
+        scope = cte_scope
+        first = token_list.token_first(skip_cm=True)
+        if first is not None and first.ttype == T.Keyword.CTE:
+            tokens, scope = self._consume_cte(token_list, tokens, cte_scope)
+        elif precollect_ctes:
+            # A WITH clause nested inside a group (e.g. a derived table)
+            # defines names that also apply to the trailing reference at
+            # this level; collect them before classifying identifiers.
+            scope = self._collect_nested_cte_names(tokens, cte_scope)
         state = initial_state
-        for token in token_list.tokens:
+        for token in tokens:
             if token.is_group:
-                state = self._visit_group(token, state, cte_scope, token_list)
+                state = self._visit_group(token, state, scope, token_list)
                 continue
             if not token.is_keyword:
                 continue
@@ -224,6 +235,75 @@ class _Collector:
             elif token.ttype in (
                     T.Keyword.DML, T.Keyword.DDL, T.Keyword.CTE):
                 state = None
+
+    def _collect_nested_cte_names(self, tokens,
+                                  cte_scope: tuple[str, ...]) -> tuple[str, ...]:
+        names = list(cte_scope)
+        for token in tokens:
+            if not token.is_group:
+                continue
+            for leaf in token.flatten():
+                if leaf.ttype != T.Keyword.CTE:
+                    continue
+                for child in leaf.parent.tokens:
+                    if isinstance(child, sql.IdentifierList):
+                        definitions = child.get_identifiers()
+                    elif isinstance(child, (sql.Identifier, sql.Function)):
+                        definitions = [child]
+                    else:
+                        continue
+                    for definition in definitions:
+                        name = self._cte_name(definition)
+                        if name is not None and name not in names:
+                            names.append(name)
+        return tuple(names)
+
+    def _consume_cte(self, token_list, tokens, cte_scope):
+        """Process a leading WITH clause.
+
+        Returns the tokens of the trailing query and the extended CTE
+        scope.  Definition names never enter the table inventory; only
+        the tables referenced by the definition bodies are recorded.
+        """
+        scope = list(cte_scope)
+        for token in tokens:
+            if isinstance(token, sql.IdentifierList):
+                definitions = list(token.get_identifiers())
+            elif isinstance(token, (sql.Identifier, sql.Function)):
+                definitions = [token]
+            elif token.ttype in (T.Keyword.DML, T.Keyword.DDL):
+                # Reached the trailing query: definitions are done.
+                index = token_list.token_index(token)
+                return tokens[index:], tuple(scope)
+            else:
+                # WITH / RECURSIVE keywords, whitespace, punctuation.
+                continue
+            for definition in definitions:
+                name = self._cte_name(definition)
+                body = definition.token_next_by(i=sql.Parenthesis)[1]
+                if body is not None:
+                    # The name is visible inside its own body (recursive
+                    # self-reference) but not yet to sibling definitions.
+                    body_scope = tuple(scope)
+                    if name is not None and name not in body_scope:
+                        body_scope = (*body_scope, name)
+                    self._walk(body, body_scope, precollect_ctes=False)
+                if name is not None and name not in scope:
+                    scope.append(name)
+        return [], tuple(scope)
+
+    @staticmethod
+    def _cte_name(definition) -> str | None:
+        # A column-list form, ``WITH c (a, b) AS (...)``, is grouped as
+        # a Function, possibly wrapped in an outer Identifier.
+        if isinstance(definition, sql.Function):
+            inner = definition.token_next_by(i=sql.Identifier)[1]
+            if inner is None:
+                return None
+            segments = _identifier_segments(inner)
+        else:
+            segments = _identifier_segments(definition)
+        return segments[0] if segments else None
 
     def _visit_group(self, token, state, cte_scope, parent):
         if isinstance(token, sql.IdentifierList):
