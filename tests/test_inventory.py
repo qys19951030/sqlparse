@@ -491,3 +491,36 @@ def test_merge_guard_and_condition_keeps_real_columns():
     refs = _column_refs(result)
     assert (None, "matched") not in refs
     assert ("tgt", "x") in refs
+
+
+def test_qualified_insert_target_with_column_list():
+    result = collect(
+        "INSERT INTO sch.dest (a, b) SELECT x FROM src;")[0]
+    entries = [(t.name, t.mode) for t in result.tables]
+    assert entries == [(("sch", "dest"), "write"), (("src",), "read")]
+    assert _column_refs(result) == [
+        (None, "a"), (None, "b"), (None, "x")]
+
+
+def test_insert_values_column_list_is_not_a_table():
+    result = collect("INSERT INTO t1 (a,b) VALUES (1, 2);")[0]
+    assert [(t.name, t.mode) for t in result.tables] == [(("t1",), "write")]
+    assert _column_refs(result) == [(None, "a"), (None, "b")]
+
+
+def test_window_definition_is_not_a_table():
+    result = collect(
+        "SELECT count(*) OVER (PARTITION BY a) FROM t1;")[0]
+    assert _table_keys(result) == [("t1",)]
+    assert _column_refs(result) == [(None, "a")]
+
+
+def test_malformed_sql_does_not_raise():
+    for sql_text in (
+        "JOIN FROM , t2 t2 DELETE DELETE SELECT JOIN DELETE DELETE FROM",
+        "SELECT = 1 WITH a , * INTO , DELETE DELETE WITH t1",
+        "DELETE JOIN WHERE b ( b SET , USING WITH *",
+        "",
+        ";;;",
+    ):
+        assert isinstance(collect(sql_text), list)

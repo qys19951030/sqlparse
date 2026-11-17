@@ -105,17 +105,26 @@ def _identifier_segments(token: sql.TokenList) -> tuple[str, ...]:
     ignored.
     """
     segments = []
+    if not isinstance(token, sql.TokenList):
+        return ()
     for child in token.tokens:
         if child.match(T.Keyword, "AS"):
             break
-        if isinstance(child, (sql.Identifier, sql.Function)):
-            # Everything from here on is an alias or a column list.  A
-            # function still carries its own name in a nested
-            # identifier (e.g. a CTE with an explicit column list).
-            if isinstance(child, sql.Function):
-                inner = child.token_next_by(i=sql.Identifier)[1]
-                if inner is not None:
-                    segments.extend(_identifier_segments(inner))
+        if isinstance(child, sql.Function):
+            # Everything from here on is a column list; the function
+            # still carries the defined name (e.g. a CTE or INSERT
+            # target with an explicit column list).
+            inner = child.token_next_by(i=sql.Identifier)[1]
+            segments.extend(
+                _identifier_segments(inner if inner is not None else child))
+            break
+        if isinstance(child, sql.Identifier):
+            # A wrapper group around the sole name expression, e.g.
+            # ``schema.tbl (a, b)`` nests the name one level down.
+            if not segments and all(
+                    sibling.is_whitespace or sibling is child
+                    for sibling in token.tokens):
+                segments.extend(_identifier_segments(child))
             break
         if not child.is_group and child.ttype in _NAME_TYPES:
             segments.append(_normalize_segment(child.value))
@@ -124,6 +133,8 @@ def _identifier_segments(token: sql.TokenList) -> tuple[str, ...]:
 
 def _identifier_alias(token) -> str | None:
     """Return the normalized alias of an identifier, if any."""
+    if not isinstance(token, sql.TokenList):
+        return None
     alias = token.get_alias()
     return None if alias is None else _normalize_segment(alias)
 
@@ -219,7 +230,7 @@ class _Collector:
         state = initial_state
         for token in tokens:
             if token.is_group:
-                state = self._visit_group(token, state, scope, token_list)
+                state = self._visit_group(token, state, scope)
                 continue
             if not token.is_keyword:
                 continue
@@ -279,7 +290,9 @@ class _Collector:
                 continue
             for definition in definitions:
                 name = self._cte_name(definition)
-                body = definition.token_next_by(i=sql.Parenthesis)[1]
+                body = None
+                if isinstance(definition, sql.TokenList):
+                    body = definition.token_next_by(i=sql.Parenthesis)[1]
                 if body is not None:
                     # The name is visible inside its own body (recursive
                     # self-reference) but not yet to sibling definitions.
@@ -304,7 +317,7 @@ class _Collector:
             segments = _identifier_segments(definition)
         return segments[0] if segments else None
 
-    def _visit_group(self, token, state, cte_scope, parent):
+    def _visit_group(self, token, state, cte_scope):
         if isinstance(token, sql.IdentifierList):
             if state in ("read", "write"):
                 for child in token.get_identifiers():
@@ -349,9 +362,21 @@ class _Collector:
         return None
 
     def _visit_identifier(self, token, mode, cte_scope):
+        if not isinstance(token, sql.TokenList):
+            # Malformed input can leave a bare keyword where an
+            # identifier was expected; it is never a table.
+            return
         first_group = next(
             (child for child in token.tokens if child.is_group), None)
         if isinstance(first_group, sql.Function):
+            if mode == "write":
+                # ``INSERT INTO t (a, b)``: the function-like group is
+                # the target table plus its column list.
+                segments = _identifier_segments(token)
+                if segments:
+                    self._record_table(
+                        segments, _identifier_alias(token), mode, cte_scope)
+                return
             # A table function is not a physical table, but a subquery
             # among its arguments still is a query.
             for child in first_group.tokens:
@@ -479,7 +504,10 @@ class _Collector:
             if isinstance(token, sql.Identifier):
                 if state in ("read", "write") and \
                         token.token_next_by(i=sql.Parenthesis)[1] is None:
-                    # A table reference or statement target.
+                    if state == "write":
+                        # ``INSERT INTO t (a, b)``: the column list is a
+                        # set of target columns, not a table.
+                        self._collect_target_column_list(token)
                     continue
                 if in_merge_guard and len(_identifier_segments(token)) == 1:
                     # A bare MATCHED / NOT guard name.
@@ -490,8 +518,29 @@ class _Collector:
                 continue
             self._collect_columns(token, state)
 
+    def _collect_target_column_list(self, identifier) -> None:
+        """Collect the ``(a, b)`` column list of an INSERT target."""
+        for child in identifier.tokens:
+            if not isinstance(child, sql.Function):
+                continue
+            for grandchild in child.tokens:
+                if not isinstance(grandchild, sql.Parenthesis) or \
+                        self._parenthesis_is_subquery(grandchild):
+                    continue
+                for leaf in grandchild.flatten():
+                    if leaf.is_group or leaf.ttype not in _NAME_TYPES:
+                        continue
+                    name = _normalize_segment(leaf.value)
+                    key = (None, name)
+                    if key not in self._column_keys:
+                        self._column_keys.add(key)
+                        self.columns.append(
+                            ColumnRef(name=name, qualifier=None))
+
     def _collect_columns_in_cte_definitions(self, group) -> None:
         """Walk only the query bodies of CTE definition groups."""
+        if not isinstance(group, sql.TokenList):
+            return
         if isinstance(group, sql.IdentifierList):
             for child in group.get_identifiers():
                 self._collect_columns_in_cte_definitions(child)
