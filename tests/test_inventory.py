@@ -502,3 +502,54 @@ def test_drop_and_truncate_targets_are_not_read_sources():
     truncate = collect("TRUNCATE TABLE t1;")[0]
     assert drop.tables == [] and drop.columns == []
     assert truncate.tables == [] and truncate.columns == []
+
+
+# ---------------------------------------------------------------------------
+# Edge cases: recursive CTE, parenthesised joins and MERGE guards
+# ---------------------------------------------------------------------------
+
+def test_recursive_cte_self_reference_resolves_to_base_table():
+    sql_text = (
+        "WITH RECURSIVE r AS ("
+        "SELECT id FROM base UNION ALL SELECT id FROM r"
+        ") SELECT * FROM r;"
+    )
+    result = collect(sql_text)[0]
+    assert _table_keys(result) == [("base",)]
+
+
+def test_parenthesised_join_group_collects_all_tables():
+    result = collect(
+        "SELECT * FROM a JOIN (b JOIN c ON b.id = c.id) "
+        "ON a.id = b.id;")[0]
+    assert _table_keys(result) == [("a",), ("b",), ("c",)]
+
+
+def test_using_column_list_is_not_a_table():
+    result = collect(
+        "SELECT * FROM a JOIN b USING (id, other_id);")[0]
+    assert _table_keys(result) == [("a",), ("b",)]
+    assert all("id" not in name for name in _table_keys(result))
+
+
+def test_merge_guard_names_are_not_columns():
+    sql_text = (
+        "MERGE INTO tgt USING src ON tgt.id = src.id "
+        "WHEN MATCHED THEN UPDATE SET a = src.b;"
+    )
+    result = collect(sql_text)[0]
+    refs = _column_refs(result)
+    assert (None, "matched") not in refs
+    assert ("tgt", "id") in refs and ("src", "id") in refs
+    assert ("src", "b") in refs and (None, "a") in refs
+
+
+def test_merge_guard_and_condition_keeps_real_columns():
+    sql_text = (
+        "MERGE INTO tgt USING src ON tgt.id = src.id "
+        "WHEN MATCHED AND tgt.x = 1 THEN UPDATE SET a = 2;"
+    )
+    result = collect(sql_text)[0]
+    refs = _column_refs(result)
+    assert (None, "matched") not in refs
+    assert ("tgt", "x") in refs

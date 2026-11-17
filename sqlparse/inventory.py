@@ -155,18 +155,21 @@ class _Collector:
     # -- token traversal -------------------------------------------------
 
     def _walk(self, token_list: sql.TokenList,
-              cte_scope: tuple[str, ...]) -> tuple[str, ...]:
+              cte_scope: tuple[str, ...],
+              initial_state=None,
+              precollect_ctes: bool = True) -> tuple[str, ...]:
         tokens = token_list.tokens
         scope = cte_scope
         first = token_list.token_first(skip_cm=True)
         if first is not None and first.ttype == T.Keyword.CTE:
             tokens, scope = self._consume_cte(token_list, tokens, cte_scope)
-        # CTEs defined inside nested groups enter the scope before the
-        # current level's identifiers are classified, so a trailing
-        # reference (e.g. the outer FROM of a derived table containing
-        # a WITH clause) is resolved against them as well.
-        scope = self._collect_nested_cte_names(tokens, scope)
-        return self._walk_tokens(tokens, scope)
+        elif precollect_ctes:
+            # CTEs defined inside nested groups enter the scope before
+            # the current level's identifiers are classified, so a
+            # trailing reference (e.g. the outer FROM of a derived table
+            # containing a WITH clause) resolves against them as well.
+            scope = self._collect_nested_cte_names(tokens, scope)
+        return self._walk_tokens(tokens, scope, initial_state)
 
     def _collect_nested_cte_names(self, tokens,
                                   scope: tuple[str, ...]) -> tuple[str, ...]:
@@ -205,19 +208,28 @@ class _Collector:
                 definitions = list(token.get_identifiers())
             elif isinstance(token, (sql.Identifier, sql.Function)):
                 definitions = [token]
-            elif token.is_keyword and token.ttype != T.Keyword.CTE:
-                # Reached the trailing DML/DDL keyword: definitions are
+            elif token.ttype in (T.Keyword.DML, T.Keyword.DDL):
+                # Reached the trailing query keyword: definitions are
                 # done, everything from here on belongs to the main query.
                 index = token_list.token_index(token)
                 return tokens[index:], tuple(scope)
             else:
+                # WITH / RECURSIVE keywords, whitespace and punctuation.
                 continue
             for definition in definitions:
                 name = self._cte_name(definition)
                 body = definition.token_next_by(i=sql.Parenthesis)[1]
                 if body is not None:
-                    self._walk(body, tuple(scope))
-                if name is not None:
+                    # The name is visible inside its own body (recursive
+                    # self-reference) but is not yet visible to sibling
+                    # definitions; it enters the shared scope only after
+                    # the body has been resolved.
+                    body_scope = tuple(scope)
+                    if name is not None and name not in body_scope:
+                        body_scope = (*body_scope, name)
+                    self._walk(
+                        body, body_scope, precollect_ctes=False)
+                if name is not None and name not in scope:
                     scope.append(name)
         return [], tuple(scope)
 
@@ -234,10 +246,11 @@ class _Collector:
             segments = _identifier_segments(definition)
         return segments[0] if segments else None
 
-    def _walk_tokens(self, tokens, cte_scope: tuple[str, ...]):
+    def _walk_tokens(self, tokens, cte_scope: tuple[str, ...],
+                     initial_state=None):
         # Clause-aware walk at one grouping level.  ``state`` tracks the
         # table-bearing clause the following identifier belongs to.
-        state = None
+        state = initial_state
         scope = cte_scope
         for token in tokens:
             if token.is_group:
@@ -292,10 +305,19 @@ class _Collector:
                             cte_scope)
             return self._walk(token, cte_scope)
         elif isinstance(token, sql.Parenthesis):
-            # Subquery: descend without inheriting the current clause,
-            # e.g. the column list of USING (...) must not be read as
-            # tables.
-            return self._walk(token, cte_scope)
+            if self._parenthesis_is_subquery(token):
+                # A real subquery starts with DML/DDL/WITH: descend
+                # without inheriting the current clause, e.g. the column
+                # list of USING (...) must not be read as tables.
+                return self._walk(token, cte_scope)
+            if self._is_parenthesised_join_group(token):
+                # A parenthesised JOIN group keeps the outer clause
+                # context so its leading table is classified too.
+                return self._walk_tokens(
+                    token.tokens, cte_scope, initial_state=state)
+            # Other bare parentheses (e.g. USING column lists) never
+            # introduce tables; scan without an inherited clause.
+            return self._walk_tokens(token.tokens, cte_scope)
         else:
             return self._walk(token, cte_scope)
 
@@ -324,10 +346,28 @@ class _Collector:
         return cte_scope
 
     @staticmethod
-    def _parenthesis_is_subquery(parenthesis: sql.Parenthesis) -> bool:
-        first = parenthesis.token_first(skip_cm=True)
+    def _first_inner_token(parenthesis: sql.Parenthesis):
+        """First token inside the parentheses, skipping the markers."""
+        for token in parenthesis.tokens:
+            if token.is_whitespace or token.ttype in T.Comment:
+                continue
+            if token.match(T.Punctuation, "("):
+                continue
+            return token
+        return None
+
+    @classmethod
+    def _parenthesis_is_subquery(cls, parenthesis: sql.Parenthesis) -> bool:
+        first = cls._first_inner_token(parenthesis)
         return first is not None and first.ttype in (
             T.Keyword.DML, T.Keyword.DDL, T.Keyword.CTE)
+
+    @staticmethod
+    def _is_parenthesised_join_group(parenthesis: sql.Parenthesis) -> bool:
+        for token in parenthesis.flatten():
+            if token.is_keyword and "JOIN" in token.normalized:
+                return True
+        return False
 
     @staticmethod
     def _is_delete_context_tokens(tokens) -> bool:
@@ -383,6 +423,7 @@ class _Collector:
         recorded as columns.
         """
         in_cte_header = False
+        in_merge_guard = False
         for token in token_list.tokens:
             if not token.is_group:
                 if token.is_keyword:
@@ -395,6 +436,13 @@ class _Collector:
                     if in_cte_header and token.ttype in (
                             T.Keyword.DML, T.Keyword.DDL):
                         in_cte_header = False
+                    if token.normalized == "WHEN":
+                        # MERGE guard: a following bare MATCHED/NOT ...
+                        # name is a guard keyword grouped as an
+                        # identifier, not a column reference.
+                        in_merge_guard = True
+                    elif token.normalized in ("THEN", "ELSE"):
+                        in_merge_guard = False
                     state = self._column_state(token, state)
                 continue
 
@@ -415,6 +463,11 @@ class _Collector:
                 if state in ("read", "write") and \
                         token.token_next_by(i=sql.Parenthesis)[1] is None:
                     # Table reference (or statement target), not a column.
+                    continue
+                if in_merge_guard and \
+                        len(_identifier_segments(token)) == 1:
+                    # A bare MATCHED/NOT guard name.  Qualified columns
+                    # in an AND condition still reach _record_column.
                     continue
                 self._record_column(token)
                 # A column identifier may still contain a subquery
