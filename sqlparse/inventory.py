@@ -193,6 +193,7 @@ class _Collector:
 
     def collect(self) -> StatementInventory:
         self._walk(self.statement, cte_scope=())
+        self._collect_columns(self.statement)
         return StatementInventory(
             type=self.statement.get_type(),
             tables=self.tables,
@@ -230,9 +231,7 @@ class _Collector:
                     state = "read"
             elif keyword in _TARGET_KEYWORDS:
                 state = "write"
-            elif keyword in _REGION_END_KEYWORDS:
-                state = None
-            elif token.ttype in (
+            elif keyword in _REGION_END_KEYWORDS or token.ttype in (
                     T.Keyword.DML, T.Keyword.DDL, T.Keyword.CTE):
                 state = None
 
@@ -416,6 +415,117 @@ class _Collector:
         ref = TableRef(name=segments, alias=alias, mode=mode, count=1)
         self._table_index[key] = ref
         self.tables.append(ref)
+
+    def _record_column(self, identifier: sql.Identifier) -> None:
+        if identifier.is_wildcard():
+            # ``*`` and ``t.*`` select whole rows, not named columns.
+            return
+        segments = _identifier_segments(identifier)
+        if not segments:
+            return
+        name = segments[-1]
+        qualifier = ".".join(segments[:-1]) or None
+        key = (qualifier, name)
+        if key in self._column_keys:
+            return
+        self._column_keys.add(key)
+        self.columns.append(ColumnRef(name=name, qualifier=qualifier))
+
+    # -- column traversal ------------------------------------------------
+
+    def _collect_columns(self, token_list: sql.TokenList,
+                         state: str | None = None) -> None:
+        """Walk the tree collecting column references.
+
+        Table-position identifiers, function calls and VALUES lists are
+        skipped; identifiers anywhere else (select lists, WHERE/ON, GROUP
+        BY/ORDER BY/HAVING, CASE expressions, scalar subqueries, ...)
+        are recorded as columns.
+        """
+        in_cte_header = False
+        in_merge_guard = False
+        for token in token_list.tokens:
+            if not token.is_group:
+                if not token.is_keyword:
+                    continue
+                if token.ttype == T.Keyword.CTE:
+                    # The following groups are CTE definitions: their
+                    # names and column-list headers are not columns.
+                    in_cte_header = True
+                    state = None
+                    continue
+                if in_cte_header and token.ttype in (
+                        T.Keyword.DML, T.Keyword.DDL):
+                    in_cte_header = False
+                if token.normalized == "WHEN":
+                    # In a MERGE statement a following bare MATCHED /
+                    # NOT name is a guard keyword, not a column.
+                    in_merge_guard = True
+                elif token.normalized in ("THEN", "ELSE"):
+                    in_merge_guard = False
+                state = self._column_state(token, state)
+                continue
+
+            if in_cte_header and isinstance(
+                    token, (sql.Identifier, sql.IdentifierList,
+                            sql.Function)):
+                self._collect_columns_in_cte_definitions(token)
+                continue
+            if isinstance(token, sql.Values):
+                continue
+            if isinstance(token, sql.Function):
+                self._collect_columns_in_function(token)
+                continue
+            if isinstance(token, sql.Identifier):
+                if state in ("read", "write") and \
+                        token.token_next_by(i=sql.Parenthesis)[1] is None:
+                    # A table reference or statement target.
+                    continue
+                if in_merge_guard and len(_identifier_segments(token)) == 1:
+                    # A bare MATCHED / NOT guard name.
+                    continue
+                self._record_column(token)
+                # A column identifier may still contain a subquery.
+                self._collect_columns(token, state)
+                continue
+            self._collect_columns(token, state)
+
+    def _collect_columns_in_cte_definitions(self, group) -> None:
+        """Walk only the query bodies of CTE definition groups."""
+        if isinstance(group, sql.IdentifierList):
+            for child in group.get_identifiers():
+                self._collect_columns_in_cte_definitions(child)
+            return
+        body = None
+        for child in group.tokens:
+            if isinstance(child, sql.Parenthesis):
+                body = child
+        if body is not None:
+            self._collect_columns(body)
+
+    def _collect_columns_in_function(self, function: sql.Function) -> None:
+        for token in function.tokens:
+            if isinstance(token, (sql.Over, sql.Parenthesis)):
+                # Window definitions (PARTITION BY / ORDER BY) and
+                # function arguments may reference real columns.
+                self._collect_columns(token)
+
+    @staticmethod
+    def _column_state(token: sql.Token, state: str | None) -> str | None:
+        keyword = token.normalized
+        if keyword in _TARGET_KEYWORDS:
+            return "write"
+        if token.ttype == T.Keyword.DDL:
+            # CREATE/DROP/ALTER ... <name>: the identifier following is
+            # an object name, not a column.
+            return "write"
+        if keyword in _FROM_KEYWORDS:
+            return "read"
+        if keyword in _REGION_END_KEYWORDS:
+            return None
+        if token.ttype in (T.Keyword.DML, T.Keyword.CTE):
+            return None
+        return state
 
 
 def collect(sql_text: str) -> list[StatementInventory]:
