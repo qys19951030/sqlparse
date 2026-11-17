@@ -145,6 +145,7 @@ class _Collector:
 
     def collect(self) -> StatementInventory:
         self._walk(self.statement, cte_scope=())
+        self._collect_columns(self.statement)
         return StatementInventory(
             type=self.statement.get_type(),
             tables=self.tables,
@@ -340,7 +341,115 @@ class _Collector:
         self.tables.append(ref)
 
     def _record_column(self, identifier: sql.Identifier):
-        raise NotImplementedError
+        if identifier.is_wildcard():
+            # ``*`` and ``t.*`` select whole rows, they are not a named
+            # column reference.
+            return
+        segments = _identifier_segments(identifier)
+        if not segments:
+            return
+        name = segments[-1]
+        qualifier = ".".join(segments[:-1]) or None
+        key = (qualifier, name)
+        if key in self._column_keys:
+            return
+        self._column_keys.add(key)
+        self.columns.append(ColumnRef(name=name, qualifier=qualifier))
+
+    # -- column traversal ------------------------------------------------
+
+    def _collect_columns(self, token_list: sql.TokenList, state=None):
+        """Walk the tree collecting column references.
+
+        Table-position identifiers, function calls and VALUES lists are
+        skipped; identifiers appearing anywhere else (select lists,
+        WHERE/ON/GROUP BY/ORDER BY/HAVING, scalar subqueries, ...) are
+        recorded as columns.
+        """
+        in_cte_header = False
+        for token in token_list.tokens:
+            if not token.is_group:
+                if token.is_keyword:
+                    if token.ttype == T.Keyword.CTE:
+                        # The following groups are CTE definitions: their
+                        # names and column-list headers are not columns.
+                        in_cte_header = True
+                        state = None
+                        continue
+                    if in_cte_header and token.ttype in (
+                            T.Keyword.DML, T.Keyword.DDL):
+                        in_cte_header = False
+                    state = self._column_state(token, state)
+                continue
+
+            if in_cte_header and isinstance(
+                    token, (sql.Identifier, sql.IdentifierList,
+                            sql.Function)):
+                self._collect_columns_from_cte_definitions(token)
+                continue
+            if isinstance(token, sql.Values):
+                continue
+            if isinstance(token, sql.Function):
+                # The function name is not a column, but window
+                # definitions and scalar function arguments may contain
+                # some.
+                self._collect_columns_in_function(token)
+                continue
+            if isinstance(token, sql.Identifier):
+                if state in ("read", "write") and \
+                        token.token_next_by(i=sql.Parenthesis)[1] is None:
+                    # Table reference (or statement target), not a column.
+                    continue
+                self._record_column(token)
+                # A column identifier may still contain a subquery
+                # (derived tables are handled by the table-position
+                # check above); descend to be safe.
+                self._collect_columns(token, state)
+                continue
+            self._collect_columns(token, state)
+
+    def _collect_columns_from_cte_definitions(self, group):
+        """Walk only the query bodies of CTE definition groups."""
+        if isinstance(group, sql.IdentifierList):
+            for child in group.get_identifiers():
+                self._collect_columns_from_cte_definitions(child)
+            return
+        # A definition holds its query body in the last parenthesised
+        # group; the CTE name and an optional column-list header come
+        # earlier and must be skipped.
+        body = None
+        for child in group.tokens:
+            if isinstance(child, sql.Parenthesis):
+                body = child
+        if body is not None:
+            self._collect_columns(body)
+
+    def _collect_columns_in_function(self, function: sql.Function):
+        for token in function.tokens:
+            if isinstance(token, sql.Over):
+                # PARTITION BY / ORDER BY inside a window definition
+                # reference real columns.
+                self._collect_columns(token)
+            elif isinstance(token, sql.Parenthesis):
+                # Function arguments may themselves be columns; literals
+                # and wildcards simply do not form Identifier groups.
+                self._collect_columns(token)
+            # the function name Identifier and whitespace are ignored
+
+    @staticmethod
+    def _column_state(token: sql.Token, state):
+        keyword = token.normalized
+        if keyword in _TARGET_KEYWORDS:
+            return "write"
+        if keyword in _FROM_KEYWORDS:
+            # DELETE FROM introduces the target table; either way the
+            # following identifier is a table, never a column.
+            return "read"
+        if keyword in _REGION_END_KEYWORDS:
+            return None
+        if token.ttype in (T.Keyword.DML, T.Keyword.DDL, T.Keyword.CTE):
+            return None
+        return state
 
 
 @dataclass
