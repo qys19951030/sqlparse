@@ -27,12 +27,132 @@ earlier ones) are resolved against the enclosing CTE scope and only the
 underlying physical tables are counted.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 
-from sqlparse import sql
+from sqlparse import parse, sql
 from sqlparse import tokens as T
 
-__all__ = ["collect", "StatementInventory", "TableRef", "ColumnRef"]
+__all__ = ["ColumnRef", "StatementInventory", "TableRef", "collect"]
+
+# ttypes that carry a name (possibly with surrounding quote characters).
+_NAME_TYPES = (T.Name, T.String.Symbol)
+
+# Keyword (normalized, upper-case) values that start a table-bearing
+# clause when they appear at statement / subquery level.
+_FROM_KEYWORDS = (
+    "FROM",
+    "JOIN",
+    "INNER JOIN",
+    "LEFT JOIN",
+    "RIGHT JOIN",
+    "FULL JOIN",
+    "LEFT OUTER JOIN",
+    "RIGHT OUTER JOIN",
+    "FULL OUTER JOIN",
+    "CROSS JOIN",
+    "NATURAL JOIN",
+    "USING",
+)
+
+# Clauses whose following identifiers are statement targets rather than
+# read sources.
+_TARGET_KEYWORDS = ("INTO", "UPDATE")
+
+# Keywords that end a FROM/JOIN region at the current query level.
+_REGION_END_KEYWORDS = (
+    "WHERE",
+    "GROUP BY",
+    "HAVING",
+    "ORDER BY",
+    "LIMIT",
+    "UNION",
+    "UNION ALL",
+    "EXCEPT",
+    "INTERSECT",
+    "ON",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "END",
+    "SET",
+    "RETURNING",
+    "VALUES",
+)
+
+
+def _normalize_segment(value: str) -> str:
+    """Normalize one name segment.
+
+    Backtick, double-quote and square-bracket wrapping is removed while
+    the quoted content is kept unchanged; unquoted names are
+    lower-cased.
+    """
+    if len(value) >= 2 and (
+        (value[0] == "`" and value[-1] == "`")
+        or (value[0] == '"' and value[-1] == '"')
+        or (value[0] == "[" and value[-1] == "]")
+    ):
+        return value[1:-1]
+    return value.lower()
+
+
+def _identifier_segments(token: sql.TokenList) -> tuple[str, ...]:
+    """Return the normalized name segments of an identifier.
+
+    Only leaf name tokens contribute, so function parentheses, typecasts
+    and similar sub-groups are ignored.
+    """
+    segments = []
+    for leaf in token.flatten():
+        if leaf.ttype in _NAME_TYPES:
+            segments.append(_normalize_segment(leaf.value))
+    return tuple(segments)
+
+
+def _identifier_alias(token: sql.Identifier) -> str | None:
+    """Return the normalized alias of an identifier, if any."""
+    alias = token.get_alias()
+    if alias is None:
+        return None
+    return _normalize_segment(alias)
+
+
+class _Collector:
+    """Collects references of one statement."""
+
+    def __init__(self, statement: sql.Statement):
+        self.statement = statement
+        self.tables: list[TableRef] = []
+        self._table_index: dict[tuple[str, ...], TableRef] = {}
+        self.columns: list[ColumnRef] = []
+        self._column_keys: set[tuple[str, ...]] = set()
+
+    def collect(self) -> StatementInventory:
+        self._walk(self.statement, cte_scope=())
+        return StatementInventory(
+            type=self.statement.get_type(),
+            tables=self.tables,
+            columns=self.columns,
+        )
+
+    # -- token traversal -------------------------------------------------
+
+    def _walk(self, token_list: sql.TokenList, cte_scope: tuple[str, ...]):
+        # Traverse the token tree without collecting anything yet;
+        # later steps add clause-aware table/column extraction here.
+        for token in token_list.tokens:
+            if token.is_group:
+                self._walk(token, cte_scope)
+
+    # -- reference recording ---------------------------------------------
+
+    def _record_table(self, segments, alias, mode):
+        raise NotImplementedError
+
+    def _record_column(self, identifier: sql.Identifier):
+        raise NotImplementedError
 
 
 @dataclass
@@ -103,4 +223,4 @@ def collect(sql_text: str) -> list[StatementInventory]:
     :returns: A list of :class:`StatementInventory` instances, one per
         statement, in the same order as :func:`sqlparse.split`.
     """
-    raise NotImplementedError
+    return [_Collector(statement).collect() for statement in parse(sql_text)]
