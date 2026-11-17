@@ -469,3 +469,36 @@ def test_cte_names_and_headers_are_not_columns():
     assert (None, "x") in refs
     # the CTE column-list header names are not added on their own
     assert len([r for r in refs if r == (None, "a")]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Edge cases: table functions and DDL
+# ---------------------------------------------------------------------------
+
+def test_table_function_is_not_a_table():
+    result = collect(
+        "SELECT * FROM unnest(ARRAY[1, 2]) AS u(id) "
+        "JOIN real_t r ON 1=1;")[0]
+    assert _table_keys(result) == [("real_t",)]
+    assert all("unnest" not in name for name in _table_keys(result))
+
+
+def test_table_function_alias_column_list_not_inventoried():
+    result = collect(
+        "SELECT * FROM generate_series(1, 5) AS g;")[0]
+    assert result.tables == []
+
+
+def test_ddl_target_is_not_collected_as_column():
+    result = collect(
+        "CREATE TABLE new_t AS SELECT col1, col2 FROM old_t;")[0]
+    assert (None, "new_t") not in _column_refs(result)
+    assert _column_refs(result) == [(None, "col1"), (None, "col2")]
+    assert _table_keys(result) == [("old_t",)]
+
+
+def test_drop_and_truncate_targets_are_not_read_sources():
+    drop = collect("DROP TABLE old_t;")[0]
+    truncate = collect("TRUNCATE TABLE t1;")[0]
+    assert drop.tables == [] and drop.columns == []
+    assert truncate.tables == [] and truncate.columns == []

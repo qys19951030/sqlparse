@@ -301,17 +301,33 @@ class _Collector:
 
     def _visit_identifier(self, token: sql.Identifier, mode,
                           cte_scope: tuple[str, ...]) -> tuple[str, ...]:
-        # A parenthesised body means a derived table (subquery in FROM);
-        # its alias is not a table name, the inner query is walked.
-        inner = token.token_next_by(i=sql.Parenthesis)[1]
-        if inner is not None:
-            return self._walk(inner, cte_scope)
+        first_group = next(
+            (child for child in token.tokens if child.is_group), None)
+        if isinstance(first_group, sql.Function):
+            # Table function / function call: not a physical table.
+            # A parenthesised subquery inside its arguments is still a
+            # query that must be walked.
+            for child in first_group.tokens:
+                if isinstance(child, sql.Parenthesis) and \
+                        self._parenthesis_is_subquery(child):
+                    self._walk(child, cte_scope)
+            return cte_scope
+        if isinstance(first_group, sql.Parenthesis):
+            # A derived table (subquery in FROM); its alias is not a
+            # table name, the inner query is walked.
+            return self._walk(first_group, cte_scope)
         segments = _identifier_segments(token)
         if not segments:
             return cte_scope
         self._record_table(
             segments, _identifier_alias(token), mode, cte_scope)
         return cte_scope
+
+    @staticmethod
+    def _parenthesis_is_subquery(parenthesis: sql.Parenthesis) -> bool:
+        first = parenthesis.token_first(skip_cm=True)
+        return first is not None and first.ttype in (
+            T.Keyword.DML, T.Keyword.DDL, T.Keyword.CTE)
 
     @staticmethod
     def _is_delete_context_tokens(tokens) -> bool:
@@ -441,13 +457,17 @@ class _Collector:
         keyword = token.normalized
         if keyword in _TARGET_KEYWORDS:
             return "write"
+        if token.ttype == T.Keyword.DDL:
+            # CREATE/DROP/ALTER ... <name>: the following identifier is
+            # an object (table) name, not a column.
+            return "write"
         if keyword in _FROM_KEYWORDS:
             # DELETE FROM introduces the target table; either way the
             # following identifier is a table, never a column.
             return "read"
         if keyword in _REGION_END_KEYWORDS:
             return None
-        if token.ttype in (T.Keyword.DML, T.Keyword.DDL, T.Keyword.CTE):
+        if token.ttype in (T.Keyword.DML, T.Keyword.CTE):
             return None
         return state
 
